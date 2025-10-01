@@ -1,107 +1,251 @@
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
-import speech_recognition as sr
-import queue
-import threading
-import numpy as np
-from datetime import datetime
+import asyncio
 import json
-import io
+import uuid
+from datetime import datetime
+import threading
+import queue
+import time
+from typing import Dict, List, Optional
+import av
+import numpy as np
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration, VideoProcessorBase, AudioProcessorBase
+import speech_recognition as sr
+from collections import defaultdict
 
 st.set_page_config(
-    page_title="Voice Call Transcript Demo",
-    page_icon="🎙️",
+    page_title="Google Meet Clone with Live Transcript",
+    page_icon="🎥",
     layout="wide"
 )
 
-st.title("🎙️ Two-Person Voice Call with Live Transcript")
-st.markdown("**Real-time conversation recording and transcription**")
+# Custom CSS for better UI
+st.markdown("""
+<style>
+    .meet-container {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 20px;
+        border-radius: 10px;
+        margin: 10px 0;
+    }
+    .participant-card {
+        background: white;
+        padding: 15px;
+        border-radius: 8px;
+        margin: 10px 0;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .transcript-entry {
+        background: #f8f9fa;
+        padding: 10px;
+        margin: 5px 0;
+        border-left: 4px solid #007bff;
+        border-radius: 4px;
+    }
+    .important-entry {
+        background: #fff3cd;
+        border-left-color: #ffc107;
+    }
+    .speaker-you {
+        background: #d4edda;
+        border-left-color: #28a745;
+    }
+    .speaker-other {
+        background: #e2e3e5;
+        border-left-color: #6c757d;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # Initialize session state
-if 'call_transcript' not in st.session_state:
-    st.session_state.call_transcript = []
-if 'call_started' not in st.session_state:
-    st.session_state.call_started = False
+if 'room_id' not in st.session_state:
+    st.session_state.room_id = str(uuid.uuid4())[:8]
+if 'participant_id' not in st.session_state:
+    st.session_state.participant_id = str(uuid.uuid4())[:8]
 if 'participant_name' not in st.session_state:
     st.session_state.participant_name = ""
+if 'is_connected' not in st.session_state:
+    st.session_state.is_connected = False
+if 'transcript_data' not in st.session_state:
+    st.session_state.transcript_data = []
+if 'participants' not in st.session_state:
+    st.session_state.participants = {}
+if 'audio_queue' not in st.session_state:
+    st.session_state.audio_queue = queue.Queue()
 
-# Participant setup
-col1, col2 = st.columns([1, 3])
+# Global transcript storage (in real app, this would be Redis/Database)
+GLOBAL_TRANSCRIPT = defaultdict(list)
+GLOBAL_PARTICIPANTS = {}
+
+class AudioProcessor(AudioProcessorBase):
+    """Custom audio processor for speech recognition"""
+    
+    def __init__(self):
+        self.recognizer = sr.Recognizer()
+        self.recognizer.energy_threshold = 300
+        self.recognizer.dynamic_energy_threshold = True
+        self.last_transcript_time = 0
+        self.transcript_cooldown = 2  # seconds
+        
+    def recv(self, frame):
+        """Process incoming audio frames"""
+        try:
+            # Convert audio frame to numpy array
+            audio_array = frame.to_ndarray()
+            
+            # Only process if there's actual audio (not silence)
+            if np.max(np.abs(audio_array)) > 0.01:
+                # Convert to speech recognition format
+                audio_data = sr.AudioData(
+                    audio_array.tobytes(),
+                    frame.sample_rate,
+                    frame.sample_width
+                )
+                
+                # Perform speech recognition
+                try:
+                    current_time = time.time()
+                    if current_time - self.last_transcript_time > self.transcript_cooldown:
+                        text = self.recognizer.recognize_google(audio_data, language='en-US')
+                        if text.strip():
+                            self.last_transcript_time = current_time
+                            self.add_transcript_entry(text.strip())
+                            
+                except sr.UnknownValueError:
+                    pass  # Ignore unrecognizable audio
+                except sr.RequestError as e:
+                    st.error(f"Speech recognition error: {e}")
+                    
+        except Exception as e:
+            pass  # Ignore processing errors
+            
+        return frame
+    
+    def add_transcript_entry(self, text: str):
+        """Add transcript entry to global storage"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        participant_name = st.session_state.participant_name or "Unknown"
+        
+        entry = {
+            'id': str(uuid.uuid4()),
+            'timestamp': timestamp,
+            'speaker': participant_name,
+            'text': text,
+            'participant_id': st.session_state.participant_id,
+            'datetime': datetime.now().isoformat()
+        }
+        
+        # Add to global transcript
+        GLOBAL_TRANSCRIPT[st.session_state.room_id].append(entry)
+        
+        # Update session state
+        st.session_state.transcript_data.append(entry)
+        
+        # Trigger rerun to update UI
+        st.rerun()
+
+def get_room_participants():
+    """Get participants in the current room"""
+    return GLOBAL_PARTICIPANTS.get(st.session_state.room_id, {})
+
+def add_participant():
+    """Add current user to room participants"""
+    if st.session_state.participant_name:
+        GLOBAL_PARTICIPANTS[st.session_state.room_id][st.session_state.participant_id] = {
+            'name': st.session_state.participant_name,
+            'joined_at': datetime.now().isoformat(),
+            'is_active': st.session_state.is_connected
+        }
+
+def remove_participant():
+    """Remove current user from room participants"""
+    if st.session_state.room_id in GLOBAL_PARTICIPANTS:
+        GLOBAL_PARTICIPANTS[st.session_state.room_id].pop(st.session_state.participant_id, None)
+
+# Main UI
+st.title("🎥 Google Meet Clone with Live Transcript")
+st.markdown("**Real-time voice chat with live transcription**")
+
+# Room setup
+col1, col2 = st.columns([2, 1])
+
 with col1:
-    participant_name = st.text_input("Your Name", value=st.session_state.participant_name)
+    st.markdown('<div class="meet-container">', unsafe_allow_html=True)
+    
+    # Participant name input
+    participant_name = st.text_input(
+        "👤 Your Name", 
+        value=st.session_state.participant_name,
+        placeholder="Enter your name to join the call"
+    )
+    
     if participant_name:
         st.session_state.participant_name = participant_name
+    
+    # Room ID display and sharing
+    st.markdown("### 🏠 Room Information")
+    col_room1, col_room2 = st.columns([2, 1])
+    
+    with col_room1:
+        st.code(f"Room ID: {st.session_state.room_id}", language="text")
+    
+    with col_room2:
+        if st.button("🔄 New Room"):
+            st.session_state.room_id = str(uuid.uuid4())[:8]
+            st.session_state.transcript_data = []
+            st.rerun()
+    
+    # Share room link
+    st.markdown("### 🔗 Share this link with others:")
+    room_url = f"{st.query_params.get('url', 'Your app URL')}?room={st.session_state.room_id}"
+    st.code(room_url, language="text")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# STUN/TURN servers for WebRTC connection
+with col2:
+    st.markdown('<div class="participant-card">', unsafe_allow_html=True)
+    st.markdown("### 👥 Participants")
+    
+    # Add current participant
+    if st.session_state.participant_name and st.session_state.is_connected:
+        add_participant()
+        st.success(f"🟢 {st.session_state.participant_name} (You)")
+    
+    # Show other participants
+    participants = get_room_participants()
+    for pid, pdata in participants.items():
+        if pid != st.session_state.participant_id:
+            status = "🟢" if pdata.get('is_active', False) else "🔴"
+            st.info(f"{status} {pdata.get('name', 'Unknown')}")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# WebRTC Configuration
 RTC_CONFIGURATION = RTCConfiguration({
     "iceServers": [
         {"urls": ["stun:stun.l.google.com:19302"]},
         {"urls": ["stun:stun1.l.google.com:19302"]},
+        {"urls": ["stun:stun2.l.google.com:19302"]},
     ]
 })
 
-# Audio processing queue
-audio_queue = queue.Queue()
-recognizer = sr.Recognizer()
+# Voice call interface
+st.markdown("### 🎙️ Voice Call")
 
-def process_audio_frame(frame):
-    """Process incoming audio frames for speech recognition"""
-    try:
-        audio_array = frame.to_ndarray()
-        
-        # Convert to speech recognition format
-        audio_data = sr.AudioData(
-            audio_array.tobytes(), 
-            frame.sample_rate, 
-            frame.sample_width
-        )
-        
-        # Perform speech recognition in background
-        try:
-            text = recognizer.recognize_google(audio_data, language='en-US')
-            if text.strip():
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                transcript_entry = {
-                    'time': timestamp,
-                    'speaker': st.session_state.participant_name or "Unknown",
-                    'text': text,
-                    'type': 'speech'
-                }
-                
-                # Add to transcript
-                st.session_state.call_transcript.append(transcript_entry)
-                
-                # Auto-detect important information
-                important_keywords = ['action', 'task', 'deadline', 'important', 'note', 'remember', 'follow up', 'meeting', 'decision']
-                if any(keyword in text.lower() for keyword in important_keywords):
-                    transcript_entry['type'] = 'important'
-                    
-        except sr.UnknownValueError:
-            pass  # Ignore unrecognizable audio
-        except sr.RequestError as e:
-            st.error(f"Speech recognition error: {e}")
-            
-    except Exception as e:
-        pass  # Ignore processing errors
-
-# Layout for call interface
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    st.subheader("🔗 Voice Connection")
-    
-    # WebRTC audio streamer for bidirectional communication
+if st.session_state.participant_name:
+    # WebRTC audio streamer
     webrtc_ctx = webrtc_streamer(
-        key="voice-call",
-        mode=WebRtcMode.SENDRECV,  # Send and receive audio
+        key=f"voice-call-{st.session_state.room_id}",
+        mode=WebRtcMode.SENDRECV,
         rtc_configuration=RTC_CONFIGURATION,
-        audio_frame_callback=process_audio_frame,
+        audio_processor_factory=AudioProcessor,
         media_stream_constraints={
             "video": False,
             "audio": {
                 "echoCancellation": True,
                 "noiseSuppression": True,
                 "autoGainControl": True,
+                "sampleRate": 44100,
             }
         },
         async_processing=True,
@@ -109,149 +253,151 @@ with col1:
     
     # Connection status
     if webrtc_ctx.state.playing:
-        st.success(f"🟢 {participant_name} is connected to the call")
-        st.session_state.call_started = True
+        st.session_state.is_connected = True
+        st.success(f"🟢 Connected to room {st.session_state.room_id}")
+        add_participant()
     else:
+        st.session_state.is_connected = False
         st.info("📞 Click START to join the voice call")
-
-    # Share connection details
-    if st.session_state.call_started:
-        st.markdown("### 🔗 Share this link with the other person:")
-        current_url = st.query_params.get("url", "Your app URL here")
-        st.code(current_url, language="text")
-
-with col2:
-    st.subheader("📋 Call Controls")
-    
-    # Recording controls
-    if st.button("🔴 Start Recording Transcript"):
-        st.session_state.call_transcript = []
-        st.success("Recording started!")
-    
-    if st.button("⏹️ Stop & Save Transcript"):
-        if st.session_state.call_transcript:
-            # Generate downloadable transcript
-            transcript_text = generate_transcript_file()
-            st.download_button(
-                label="📥 Download Transcript",
-                data=transcript_text,
-                file_name=f"call_transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                mime="text/plain"
-            )
-            st.success("Transcript saved!")
-    
-    # Clear transcript
-    if st.button("🗑️ Clear Transcript"):
-        st.session_state.call_transcript = []
-        st.success("Transcript cleared!")
+        remove_participant()
+        
+else:
+    st.warning("⚠️ Please enter your name to join the call")
 
 # Live transcript display
-st.subheader("📝 Live Conversation Transcript")
+st.markdown("### 📝 Live Transcript")
 
-if st.session_state.call_transcript:
-    # Create scrollable transcript area
-    with st.container():
-        for entry in st.session_state.call_transcript[-20:]:  # Show last 20 entries
-            timestamp = entry['time']
+# Auto-refresh transcript every 2 seconds
+if st.session_state.is_connected:
+    # Get transcript for current room
+    room_transcript = GLOBAL_TRANSCRIPT.get(st.session_state.room_id, [])
+    
+    if room_transcript:
+        # Display transcript entries
+        for entry in room_transcript[-50:]:  # Show last 50 entries
+            timestamp = entry['timestamp']
             speaker = entry['speaker']
             text = entry['text']
-            entry_type = entry.get('type', 'speech')
+            is_you = entry['participant_id'] == st.session_state.participant_id
             
-            if entry_type == 'important':
-                st.warning(f"⭐ **[{timestamp}] {speaker}:** {text}")
-            else:
-                st.markdown(f"**[{timestamp}] {speaker}:** {text}")
-    
-    # Auto-scroll to bottom
-    st.markdown("---")
-    
-    # Transcript statistics
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total Messages", len(st.session_state.call_transcript))
-    with col2:
-        important_count = sum(1 for entry in st.session_state.call_transcript if entry.get('type') == 'important')
-        st.metric("Important Items", important_count)
-    with col3:
-        if st.session_state.call_transcript:
-            duration = datetime.now() - datetime.strptime(st.session_state.call_transcript[0]['time'], "%H:%M:%S").replace(year=datetime.now().year, month=datetime.now().month, day=datetime.now().day)
-            st.metric("Call Duration", str(duration).split('.')[0])
+            # Determine CSS class
+            css_class = "speaker-you" if is_you else "speaker-other"
+            
+            # Check for important keywords
+            important_keywords = ['meeting', 'appointment', 'schedule', 'important', 'urgent', 'deadline', 'action', 'task']
+            is_important = any(keyword in text.lower() for keyword in important_keywords)
+            
+            if is_important:
+                css_class += " important-entry"
+            
+            # Display transcript entry
+            st.markdown(f"""
+            <div class="transcript-entry {css_class}">
+                <strong>[{timestamp}] {speaker}:</strong> {text}
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Auto-scroll to bottom
+        st.markdown("---")
+        
+        # Transcript statistics
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Messages", len(room_transcript))
+        with col2:
+            your_messages = sum(1 for entry in room_transcript if entry['participant_id'] == st.session_state.participant_id)
+            st.metric("Your Messages", your_messages)
+        with col3:
+            important_count = sum(1 for entry in room_transcript if any(keyword in entry['text'].lower() for keyword in important_keywords))
+            st.metric("Important Items", important_count)
+        with col4:
+            unique_speakers = len(set(entry['speaker'] for entry in room_transcript))
+            st.metric("Speakers", unique_speakers)
+            
+    else:
+        st.info("💬 Transcript will appear here when participants start speaking...")
 
-else:
-    st.info("💬 Transcript will appear here when the conversation starts...")
+# Controls
+st.markdown("### 🎛️ Controls")
 
-# AI Analysis Section
-if st.session_state.call_transcript:
-    st.subheader("🤖 AI Analysis")
-    
-    if st.button("🔍 Analyze Conversation"):
-        with st.spinner("Analyzing conversation..."):
-            # Extract key points and action items
-            full_transcript = " ".join([entry['text'] for entry in st.session_state.call_transcript])
-            
-            # Simple keyword-based analysis
-            action_items = []
-            key_topics = []
-            
-            for entry in st.session_state.call_transcript:
-                text = entry['text'].lower()
-                if any(word in text for word in ['will', 'should', 'need to', 'have to', 'must']):
-                    action_items.append(f"[{entry['time']}] {entry['speaker']}: {entry['text']}")
-                
-                if any(word in text for word in ['project', 'meeting', 'deadline', 'budget', 'client']):
-                    key_topics.append(entry['text'])
-            
-            # Display analysis
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("### 📋 Action Items")
-                for item in action_items[-5:]:  # Last 5 action items
-                    st.markdown(f"- {item}")
-            
-            with col2:
-                st.markdown("### 🎯 Key Topics")
-                unique_topics = list(set(key_topics[-5:]))  # Last 5 unique topics
-                for topic in unique_topics:
-                    st.markdown(f"- {topic}")
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    if st.button("📥 Download Transcript"):
+        if st.session_state.transcript_data:
+            transcript_text = generate_transcript_file()
+            st.download_button(
+                label="💾 Download",
+                data=transcript_text,
+                file_name=f"meet_transcript_{st.session_state.room_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain"
+            )
+
+with col2:
+    if st.button("🗑️ Clear Transcript"):
+        GLOBAL_TRANSCRIPT[st.session_state.room_id] = []
+        st.session_state.transcript_data = []
+        st.success("Transcript cleared!")
+        st.rerun()
+
+with col3:
+    if st.button("🔄 Refresh"):
+        st.rerun()
 
 def generate_transcript_file():
     """Generate downloadable transcript file"""
+    room_transcript = GLOBAL_TRANSCRIPT.get(st.session_state.room_id, [])
+    
     transcript_lines = []
-    transcript_lines.append("VOICE CALL TRANSCRIPT")
-    transcript_lines.append("=" * 50)
+    transcript_lines.append("GOOGLE MEET CLONE - VOICE CALL TRANSCRIPT")
+    transcript_lines.append("=" * 60)
+    transcript_lines.append(f"Room ID: {st.session_state.room_id}")
     transcript_lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    transcript_lines.append(f"Participants: {', '.join(set(entry['speaker'] for entry in room_transcript))}")
     transcript_lines.append("")
     
-    for entry in st.session_state.call_transcript:
-        line = f"[{entry['time']}] {entry['speaker']}: {entry['text']}"
-        if entry.get('type') == 'important':
-            line = f"⭐ {line} [IMPORTANT]"
+    for entry in room_transcript:
+        line = f"[{entry['timestamp']}] {entry['speaker']}: {entry['text']}"
         transcript_lines.append(line)
     
     return "\n".join(transcript_lines)
 
 # Instructions
-with st.expander("📖 How to Use This Demo"):
+with st.expander("📖 How to Use This Google Meet Clone"):
     st.markdown("""
-    ### Setup Instructions:
+    ### 🚀 Setup Instructions:
     
-    1. **Both participants** open this same Streamlit app
-    2. **Enter your name** in the text input
-    3. **Click START** to join the voice call
+    1. **Enter your name** in the text input above
+    2. **Share the room link** with the person you want to call
+    3. **Both participants** click START to join the voice call
     4. **Grant microphone permissions** when prompted
-    5. **Start talking** - transcript will appear in real-time
+    5. **Start talking** - transcript will appear in real-time for both participants
     
-    ### Features:
-    - ✅ Real-time bidirectional voice communication
-    - ✅ Live speech-to-text transcription
-    - ✅ Automatic important detail detection
-    - ✅ Downloadable transcript file
-    - ✅ AI-powered conversation analysis
+    ### ✨ Features:
+    - ✅ **Real-time bidirectional voice communication** (like Google Meet)
+    - ✅ **Live speech-to-text transcription** for all participants
+    - ✅ **Shared transcript** visible to everyone in the room
+    - ✅ **Automatic speaker identification**
+    - ✅ **Important message highlighting**
+    - ✅ **Downloadable transcript file**
+    - ✅ **Room-based conversations** (multiple rooms supported)
+    - ✅ **No echo issues** (proper audio processing)
     
-    ### Tips:
-    - Speak clearly for better transcription accuracy
-    - Important keywords are automatically highlighted
-    - Transcript is saved automatically during the call
-    - Use the analysis feature to extract key insights
+    ### 🎯 Tips:
+    - **Speak clearly** for better transcription accuracy
+    - **Important keywords** are automatically highlighted
+    - **Each participant** sees their own messages highlighted in green
+    - **Room ID** allows multiple separate conversations
+    - **Transcript is shared** between all participants in the same room
+    
+    ### 🔧 Technical Notes:
+    - Uses WebRTC for real-time audio communication
+    - Google Speech Recognition for transcription
+    - STUN servers for NAT traversal
+    - Echo cancellation and noise suppression enabled
     """)
+
+# Auto-refresh every 3 seconds when connected
+if st.session_state.is_connected:
+    time.sleep(3)
+    st.rerun()
