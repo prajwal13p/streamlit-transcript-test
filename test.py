@@ -111,11 +111,21 @@ class AudioProcessor(AudioProcessorBase):
                 
                 # Only process if there's actual audio (not silence)
                 if np.max(np.abs(combined_audio)) > 0.01:
+                    # Get sample width - try different approaches
+                    sample_width = 2  # Default to 16-bit (2 bytes)
+                    
+                    # Try to get sample width from frame
+                    if hasattr(frame, 'format') and frame.format:
+                        if hasattr(frame.format, 'bytes'):
+                            sample_width = frame.format.bytes
+                        elif hasattr(frame.format, 'sample_width'):
+                            sample_width = frame.format.sample_width
+                    
                     # Convert to speech recognition format
                     audio_data = sr.AudioData(
                         combined_audio.tobytes(),
                         frame.sample_rate,
-                        frame.sample_width
+                        sample_width
                     )
                     
                     # Perform speech recognition
@@ -177,8 +187,16 @@ def add_participant():
         GLOBAL_PARTICIPANTS[st.session_state.room_id][st.session_state.participant_id] = {
             'name': st.session_state.participant_name,
             'joined_at': datetime.now().isoformat(),
-            'is_active': st.session_state.is_connected
+            'is_active': st.session_state.is_connected,
+            'last_seen': datetime.now().isoformat()
         }
+
+def update_participant_status():
+    """Update participant status in global state"""
+    if st.session_state.participant_name and st.session_state.room_id in GLOBAL_PARTICIPANTS:
+        if st.session_state.participant_id in GLOBAL_PARTICIPANTS[st.session_state.room_id]:
+            GLOBAL_PARTICIPANTS[st.session_state.room_id][st.session_state.participant_id]['is_active'] = st.session_state.is_connected
+            GLOBAL_PARTICIPANTS[st.session_state.room_id][st.session_state.participant_id]['last_seen'] = datetime.now().isoformat()
 
 def remove_participant():
     """Remove current user from room participants"""
@@ -272,17 +290,24 @@ with col2:
     st.markdown('<div class="participant-card">', unsafe_allow_html=True)
     st.markdown("### 👥 Participants")
     
-    # Add current participant
-    if st.session_state.participant_name and st.session_state.is_connected:
+    # Add current participant immediately when they enter the room
+    if st.session_state.participant_name:
         add_participant()
-        st.success(f"🟢 {st.session_state.participant_name} (You)")
+        if st.session_state.is_connected:
+            st.success(f"🟢 {st.session_state.participant_name} (You) - Connected")
+        else:
+            st.info(f"👤 {st.session_state.participant_name} (You) - In Room")
     
     # Show other participants
     participants = get_room_participants()
-    for pid, pdata in participants.items():
-        if pid != st.session_state.participant_id:
-            status = "🟢" if pdata.get('is_active', False) else "🔴"
-            st.info(f"{status} {pdata.get('name', 'Unknown')}")
+    if participants:
+        st.markdown("**Other Participants:**")
+        for pid, pdata in participants.items():
+            if pid != st.session_state.participant_id:
+                status = "🟢" if pdata.get('is_active', False) else "🔴"
+                st.write(f"{status} {pdata.get('name', 'Unknown')}")
+    else:
+        st.info("No other participants in this room yet")
     
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -311,7 +336,14 @@ if st.session_state.participant_name:
                 "echoCancellation": True,
                 "noiseSuppression": True,
                 "autoGainControl": True,
-                "sampleRate": 44100,
+                "sampleRate": 16000,  # Lower sample rate for better speech recognition
+                "channelCount": 1,    # Mono audio
+                "latency": 0.01,      # Low latency
+                "googEchoCancellation": True,
+                "googAutoGainControl": True,
+                "googNoiseSuppression": True,
+                "googHighpassFilter": True,
+                "googTypingNoiseDetection": True,
             }
         },
         async_processing=True,
@@ -320,12 +352,12 @@ if st.session_state.participant_name:
     # Connection status
     if webrtc_ctx.state.playing:
         st.session_state.is_connected = True
+        update_participant_status()
         st.success(f"🟢 Connected to room {st.session_state.room_id}")
-        add_participant()
     else:
         st.session_state.is_connected = False
+        update_participant_status()
         st.info("📞 Click START to join the voice call")
-        remove_participant()
         
 else:
     st.warning("⚠️ Please enter your name to join the call")
@@ -425,6 +457,25 @@ with col4:
         GLOBAL_TRANSCRIPT[st.session_state.room_id].append(test_entry)
         st.session_state.transcript_data.append(test_entry)
         st.success("Test message added!")
+        st.rerun()
+
+# Add manual text input for testing
+if st.session_state.participant_name:
+    st.markdown("### 📝 Manual Message")
+    manual_text = st.text_input("Type a message to add to transcript:", key="manual_text")
+    if st.button("Send Message") and manual_text.strip():
+        manual_entry = {
+            'id': str(uuid.uuid4()),
+            'timestamp': datetime.now().strftime("%H:%M:%S"),
+            'speaker': st.session_state.participant_name,
+            'text': manual_text.strip(),
+            'participant_id': st.session_state.participant_id,
+            'datetime': datetime.now().isoformat()
+        }
+        
+        GLOBAL_TRANSCRIPT[st.session_state.room_id].append(manual_entry)
+        st.session_state.transcript_data.append(manual_entry)
+        st.success("Message sent!")
         st.rerun()
 
 def generate_transcript_file():
