@@ -91,7 +91,9 @@ class AudioProcessor(AudioProcessorBase):
         self.recognizer.energy_threshold = 300
         self.recognizer.dynamic_energy_threshold = True
         self.last_transcript_time = 0
-        self.transcript_cooldown = 2  # seconds
+        self.transcript_cooldown = 3  # seconds
+        self.audio_buffer = []
+        self.buffer_size = 10  # Collect 10 frames before processing
         
     def recv(self, frame):
         """Process incoming audio frames"""
@@ -99,31 +101,42 @@ class AudioProcessor(AudioProcessorBase):
             # Convert audio frame to numpy array
             audio_array = frame.to_ndarray()
             
-            # Only process if there's actual audio (not silence)
-            if np.max(np.abs(audio_array)) > 0.01:
-                # Convert to speech recognition format
-                audio_data = sr.AudioData(
-                    audio_array.tobytes(),
-                    frame.sample_rate,
-                    frame.sample_width
-                )
+            # Add to buffer
+            self.audio_buffer.append(audio_array)
+            
+            # Process when buffer is full
+            if len(self.audio_buffer) >= self.buffer_size:
+                # Combine audio frames
+                combined_audio = np.concatenate(self.audio_buffer)
                 
-                # Perform speech recognition
-                try:
-                    current_time = time.time()
-                    if current_time - self.last_transcript_time > self.transcript_cooldown:
-                        text = self.recognizer.recognize_google(audio_data, language='en-US')
-                        if text.strip():
-                            self.last_transcript_time = current_time
-                            self.add_transcript_entry(text.strip())
-                            
-                except sr.UnknownValueError:
-                    pass  # Ignore unrecognizable audio
-                except sr.RequestError as e:
-                    st.error(f"Speech recognition error: {e}")
+                # Only process if there's actual audio (not silence)
+                if np.max(np.abs(combined_audio)) > 0.01:
+                    # Convert to speech recognition format
+                    audio_data = sr.AudioData(
+                        combined_audio.tobytes(),
+                        frame.sample_rate,
+                        frame.sample_width
+                    )
+                    
+                    # Perform speech recognition
+                    try:
+                        current_time = time.time()
+                        if current_time - self.last_transcript_time > self.transcript_cooldown:
+                            text = self.recognizer.recognize_google(audio_data, language='en-US')
+                            if text.strip():
+                                self.last_transcript_time = current_time
+                                self.add_transcript_entry(text.strip())
+                                
+                    except sr.UnknownValueError:
+                        pass  # Ignore unrecognizable audio
+                    except sr.RequestError as e:
+                        print(f"Speech recognition error: {e}")
+                
+                # Clear buffer
+                self.audio_buffer = []
                     
         except Exception as e:
-            pass  # Ignore processing errors
+            print(f"Audio processing error: {e}")
             
         return frame
     
@@ -157,6 +170,10 @@ def get_room_participants():
 def add_participant():
     """Add current user to room participants"""
     if st.session_state.participant_name:
+        # Initialize room if it doesn't exist
+        if st.session_state.room_id not in GLOBAL_PARTICIPANTS:
+            GLOBAL_PARTICIPANTS[st.session_state.room_id] = {}
+        
         GLOBAL_PARTICIPANTS[st.session_state.room_id][st.session_state.participant_id] = {
             'name': st.session_state.participant_name,
             'joined_at': datetime.now().isoformat(),
@@ -223,8 +240,23 @@ with col1:
     
     # Share room link
     st.markdown("### 🔗 Share this link with others:")
-    room_url = f"{st.query_params.get('url', 'Your app URL')}?room={st.session_state.room_id}"
-    st.code(room_url, language="text")
+    
+    # Get the actual URL
+    import socket
+    try:
+        # Get local IP address
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
+        actual_url = f"http://{local_ip}:8501?room={st.session_state.room_id}"
+    except:
+        actual_url = f"http://localhost:8501?room={st.session_state.room_id}"
+    
+    st.code(actual_url, language="text")
+    
+    # Copy button functionality
+    if st.button("📋 Copy Link"):
+        st.write("Link copied! Share this with your friend:")
+        st.code(actual_url, language="text")
     
     # Quick join instructions
     st.markdown("### 📋 How to Join:")
@@ -354,7 +386,7 @@ if st.session_state.is_connected:
 # Controls
 st.markdown("### 🎛️ Controls")
 
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 
 with col1:
     if st.button("📥 Download Transcript"):
@@ -376,6 +408,23 @@ with col2:
 
 with col3:
     if st.button("🔄 Refresh"):
+        st.rerun()
+
+with col4:
+    if st.button("🧪 Test Transcript"):
+        # Add a test transcript entry
+        test_entry = {
+            'id': str(uuid.uuid4()),
+            'timestamp': datetime.now().strftime("%H:%M:%S"),
+            'speaker': st.session_state.participant_name or "Test User",
+            'text': "This is a test message to verify transcript is working",
+            'participant_id': st.session_state.participant_id,
+            'datetime': datetime.now().isoformat()
+        }
+        
+        GLOBAL_TRANSCRIPT[st.session_state.room_id].append(test_entry)
+        st.session_state.transcript_data.append(test_entry)
+        st.success("Test message added!")
         st.rerun()
 
 def generate_transcript_file():
