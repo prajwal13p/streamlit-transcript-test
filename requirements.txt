@@ -1,0 +1,5 @@
+streamlit
+streamlit-webrtc
+SpeechRecognition
+numpy
+watchdog
