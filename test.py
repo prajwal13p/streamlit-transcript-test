@@ -59,7 +59,13 @@ st.markdown("""
 
 # Initialize session state
 if 'room_id' not in st.session_state:
-    st.session_state.room_id = str(uuid.uuid4())[:8]
+    # Check if room ID is provided in URL parameters
+    url_room_id = st.query_params.get('room', '')
+    if url_room_id and len(url_room_id) == 8:
+        st.session_state.room_id = url_room_id
+    else:
+        st.session_state.room_id = str(uuid.uuid4())[:8]
+
 if 'participant_id' not in st.session_state:
     st.session_state.participant_id = str(uuid.uuid4())[:8]
 if 'participant_name' not in st.session_state:
@@ -182,23 +188,51 @@ with col1:
     if participant_name:
         st.session_state.participant_name = participant_name
     
-    # Room ID display and sharing
+    # Room ID input and sharing
     st.markdown("### 🏠 Room Information")
+    
+    # Room ID input
     col_room1, col_room2 = st.columns([2, 1])
     
     with col_room1:
-        st.code(f"Room ID: {st.session_state.room_id}", language="text")
+        room_input = st.text_input(
+            "🏠 Enter Room ID to join existing room", 
+            value=st.session_state.room_id,
+            placeholder="Enter 8-character room ID",
+            help="Leave empty to create a new room"
+        )
+        
+        if room_input and room_input != st.session_state.room_id:
+            if len(room_input) == 8:
+                st.session_state.room_id = room_input
+                st.session_state.transcript_data = []
+                st.success(f"✅ Joined room: {room_input}")
+                st.rerun()
+            else:
+                st.error("❌ Room ID must be 8 characters long")
     
     with col_room2:
         if st.button("🔄 New Room"):
             st.session_state.room_id = str(uuid.uuid4())[:8]
             st.session_state.transcript_data = []
+            st.success(f"✅ Created new room: {st.session_state.room_id}")
             st.rerun()
+    
+    # Display current room ID
+    st.code(f"Current Room ID: {st.session_state.room_id}", language="text")
     
     # Share room link
     st.markdown("### 🔗 Share this link with others:")
     room_url = f"{st.query_params.get('url', 'Your app URL')}?room={st.session_state.room_id}"
     st.code(room_url, language="text")
+    
+    # Quick join instructions
+    st.markdown("### 📋 How to Join:")
+    st.markdown("""
+    **Method 1:** Share the link above with your friend
+    **Method 2:** Tell your friend the Room ID: `{}`
+    **Method 3:** Your friend can enter the Room ID in the input field above
+    """.format(st.session_state.room_id))
     
     st.markdown('</div>', unsafe_allow_html=True)
 
